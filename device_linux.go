@@ -217,8 +217,14 @@ func (d *device) SendHCIRawCommand(c cmd.CmdParam) ([]byte, error) {
 	return d.hci.SendRawCommand(c)
 }
 
-func (d *device) GetPeripheral(b []byte) (Peripheral, error) {
+func (d *device) GetPeripheral(b []byte, random bool) (Peripheral, error) {
 	pd, err := d.hci.GetPlatData(b)
+
+	if random {
+		pd.AddressType = 0x01
+	} else {
+		pd.AddressType = 0x00
+	}
 
 	if err != nil {
 		log.Printf("GetPeripheral(): %s", err.Error())
