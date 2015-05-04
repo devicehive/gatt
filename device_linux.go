@@ -2,258 +2,461 @@ package gatt
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"log"
-	"net"
+	"sync"
+	"time"
 
-	"github.com/paypal/gatt/linux"
-	"github.com/paypal/gatt/linux/cmd"
+	"github.com/paypal/gatt/xpc"
 )
 
 type device struct {
 	deviceHandler
 
-	hci   *linux.HCI
-	state State
+	conn xpc.XPC
 
-	// All the following fields are only used peripheralManager (server) implementation.
-	svcs  []*Service
-	attrs *attrRange
+	role int // 1: peripheralManager (server), 0: centralManager (client)
 
-	devID   int
-	chkLE   bool
-	maxConn int
+	reqc chan message
+	rspc chan message
 
-	advData   *cmd.LESetAdvertisingData
-	scanResp  *cmd.LESetScanResponseData
-	advParam  *cmd.LESetAdvertisingParameters
-	scanParam *cmd.LESetScanParameters
+	// Only used in client/centralManager implementation
+	plist   map[string]*peripheral
+	plistmu *sync.Mutex
+
+	// Only used in server/peripheralManager implementation
+
+	attrN int
+	attrs map[int]*attr
+
+	subscribers map[string]*central
 }
 
 func NewDevice(opts ...Option) (Device, error) {
 	d := &device{
-		maxConn: 1,    // Support 1 connection at a time.
-		devID:   -1,   // Find an available HCI device.
-		chkLE:   true, // Check if the device supports LE.
+		reqc:    make(chan message),
+		rspc:    make(chan message),
+		plist:   map[string]*peripheral{},
+		plistmu: &sync.Mutex{},
 
-		advParam: &cmd.LESetAdvertisingParameters{
-			AdvertisingIntervalMin:  0x800,     // [0x0800]: 0.625 ms * 0x0800 = 1280.0 ms
-			AdvertisingIntervalMax:  0x800,     // [0x0800]: 0.625 ms * 0x0800 = 1280.0 ms
-			AdvertisingType:         0x00,      // [0x00]: ADV_IND, 0x01: DIRECT(HIGH), 0x02: SCAN, 0x03: NONCONN, 0x04: DIRECT(LOW)
-			OwnAddressType:          0x00,      // [0x00]: public, 0x01: random
-			DirectAddressType:       0x00,      // [0x00]: public, 0x01: random
-			DirectAddress:           [6]byte{}, // Public or Random Address of the device to be connected
-			AdvertisingChannelMap:   0x7,       // [0x07] 0x01: ch37, 0x2: ch38, 0x4: ch39
-			AdvertisingFilterPolicy: 0x00,
-		},
-		scanParam: &cmd.LESetScanParameters{
-			LEScanType:           0x00,   // [0x00]: passive, 0x01: active
-			LEScanInterval:       0x0010, // [0x10]: 0.625ms * 16
-			LEScanWindow:         0x0010, // [0x10]: 0.625ms * 16
-			OwnAddressType:       0x00,   // [0x00]: public, 0x01: random
-			ScanningFilterPolicy: 0x00,   // [0x00]: accept all, 0x01: ignore non-white-listed.
-		},
+		attrN: 1,
+		attrs: make(map[int]*attr),
+
+		subscribers: make(map[string]*central),
 	}
-
 	d.Option(opts...)
-	h, err := linux.NewHCI(d.devID, d.chkLE, d.maxConn)
-	if err != nil {
-		return nil, err
-	}
-
-	d.hci = h
+	d.conn = xpc.XpcConnect("com.apple.blued", d)
 	return d, nil
 }
 
 func (d *device) Init(f func(Device, State)) error {
-	d.hci.AcceptMasterHandler = func(pd *linux.PlatData) {
-		a := pd.Address
-		c := newCentral(d.attrs, net.HardwareAddr([]byte{a[5], a[4], a[3], a[2], a[1], a[0]}), pd.Conn)
-		if d.centralConnected != nil {
-			d.centralConnected(c)
-		}
-		c.loop()
-		if d.centralDisconnected != nil {
-			d.centralDisconnected(c)
-		}
-	}
-	d.hci.AcceptSlaveHandler = func(pd *linux.PlatData) {
-		p := &peripheral{
-			d:     d,
-			pd:    pd,
-			l2c:   pd.Conn,
-			reqc:  make(chan message),
-			quitc: make(chan struct{}),
-			sub:   newSubscriber(),
-		}
-		if d.peripheralConnected != nil {
-			go d.peripheralConnected(p, nil)
-		}
-		p.loop()
-		if d.peripheralDisconnected != nil {
-			d.peripheralDisconnected(p, nil)
-		}
-	}
-	d.hci.AdvertisementHandler = func(pd *linux.PlatData) {
-		a := &Advertisement{}
-		a.unmarshall(pd.Data)
-		a.Connectable = pd.Connectable
-		p := &peripheral{pd: pd, d: d}
-		if d.peripheralDiscovered != nil {
-			pd.Name = a.LocalName
-			d.peripheralDiscovered(p, a, int(pd.RSSI))
-		}
-	}
-	d.state = StatePoweredOn
+	go d.loop()
+	rsp := d.sendReq(1, xpc.Dict{
+		"kCBMsgArgName":    fmt.Sprintf("gopher-%v", time.Now().Unix()),
+		"kCBMsgArgOptions": xpc.Dict{"kCBInitOptionShowPowerAlert": 1},
+		"kCBMsgArgType":    1,
+	})
 	d.stateChanged = f
-	go d.stateChanged(d, d.state)
+	go d.stateChanged(d, State(rsp.MustGetInt("kCBMsgArgState")))
 	return nil
 }
 
-func (d *device) Stop() error {
-	d.state = StatePoweredOff
-	defer d.stateChanged(d, d.state)
-	return d.hci.Close()
-}
-
-func (d *device) AddService(s *Service) error {
-	d.svcs = append(d.svcs, s)
-	d.attrs = generateAttributes(d.svcs, uint16(1)) // ble attrs start at 1
+func (d *device) AdvertiseNameAndServices(name string, ss []UUID) error {
+	us := uuidSlice(ss)
+	rsp := d.sendReq(8, xpc.Dict{
+		"kCBAdvDataLocalName":    name,
+		"kCBAdvDataServiceUUIDs": us},
+	)
+	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
+		return errors.New("FIXME: Advertise error")
+	}
 	return nil
 }
 
-func (d *device) RemoveAllServices() error {
-	d.svcs = nil
-	d.attrs = nil
+func (d *device) AdvertiseIBeaconData(data []byte) error {
+	rsp := d.sendReq(8, xpc.Dict{"kCBAdvDataAppleBeaconKey": data})
+	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
+		return errors.New("FIXME: Advertise error")
+	}
 	return nil
-}
-
-func (d *device) SetServices(s []*Service) error {
-	d.RemoveAllServices()
-	d.svcs = append(d.svcs, s...)
-	d.attrs = generateAttributes(d.svcs, uint16(1)) // ble attrs start at 1
-	return nil
-}
-
-func (d *device) AdvertiseNameAndServices(name string, uu []UUID) error {
-	a := &AdvPacket{}
-	a.AppendFlags(flagGeneralDiscoverable | flagLEOnly)
-	for _, u := range uu {
-		if u.Equal(attrGAPUUID) || u.Equal(attrGATTUUID) {
-			continue
-		}
-		if ok := a.AppendUUIDFit(u); !ok {
-			break
-		}
-	}
-	if len(a.b)+len(name)+2 < MaxEIRPacketLength {
-		a.AppendName(name)
-		d.scanResp = nil
-	} else {
-		a := &AdvPacket{}
-		a.AppendName(name)
-		d.scanResp = &cmd.LESetScanResponseData{
-			ScanResponseDataLength: uint8(a.Len()),
-			ScanResponseData:       a.Bytes(),
-		}
-	}
-	d.advData = &cmd.LESetAdvertisingData{
-		AdvertisingDataLength: uint8(a.Len()),
-		AdvertisingData:       a.Bytes(),
-	}
-
-	if err := d.update(); err != nil {
-		return err
-	}
-	return d.hci.SetAdvertiseEnable(true)
-}
-
-func (d *device) AdvertiseIBeaconData(b []byte) error {
-	a := &AdvPacket{}
-	a.AppendFlags(flagGeneralDiscoverable | flagLEOnly)
-	a.AppendManufacturerData(0x004C, b)
-	d.advData = &cmd.LESetAdvertisingData{
-		AdvertisingDataLength: uint8(a.Len()),
-		AdvertisingData:       a.Bytes(),
-	}
-	if err := d.update(); err != nil {
-		return err
-	}
-	return d.hci.SetAdvertiseEnable(true)
 }
 
 func (d *device) AdvertiseIBeacon(u UUID, major, minor uint16, pwr int8) error {
-	b := make([]byte, 23)
-	b[0] = 0x02                               // Data type: iBeacon
-	b[1] = 0x15                               // Data length: 21 bytes
-	copy(b[2:], reverse(u.b))                 // Big endian
-	binary.BigEndian.PutUint16(b[18:], major) // Big endian
-	binary.BigEndian.PutUint16(b[20:], minor) // Big endian
-	b[22] = uint8(pwr)                        // Measured Tx Power
+	b := make([]byte, 21)
+	copy(b, reverse(u.b))                     // Big endian
+	binary.BigEndian.PutUint16(b[16:], major) // Big endian
+	binary.BigEndian.PutUint16(b[18:], minor) // Big endian
+	b[20] = uint8(pwr)                        // Measured Tx Power
 	return d.AdvertiseIBeaconData(b)
 }
 
 func (d *device) StopAdvertising() error {
-	return d.hci.SetAdvertiseEnable(false)
+	rsp := d.sendReq(9, nil)
+	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
+		return errors.New("FIXME: Stop Advertise error")
+	}
+	return nil
+}
+
+func (d *device) RemoveAllServices() error {
+	d.sendCmd(12, nil)
+	return nil
+}
+
+func (d *device) AddService(s *Service) error {
+	if s.uuid.Equal(attrGAPUUID) || s.uuid.Equal(attrGATTUUID) {
+		// skip GATT and GAP services
+		return nil
+	}
+
+	xs := xpc.Dict{
+		"kCBMsgArgAttributeID":     d.attrN,
+		"kCBMsgArgAttributeIDs":    []int{},
+		"kCBMsgArgCharacteristics": nil,
+		"kCBMsgArgType":            1, // 1 => primary, 0 => excluded
+		"kCBMsgArgUUID":            reverse(s.uuid.b),
+	}
+	d.attrN++
+
+	xcs := xpc.Array{}
+	for _, c := range s.Characteristics() {
+		props := 0
+		perm := 0
+		if c.props&CharRead != 0 {
+			props |= 0x02
+			if CharRead&c.secure != 0 {
+				perm |= 0x04
+			} else {
+				perm |= 0x01
+			}
+		}
+		if c.props&CharWriteNR != 0 {
+			props |= 0x04
+			if c.secure&CharWriteNR != 0 {
+				perm |= 0x08
+			} else {
+				perm |= 0x02
+			}
+		}
+		if c.props&CharWrite != 0 {
+			props |= 0x08
+			if c.secure&CharWrite != 0 {
+				perm |= 0x08
+			} else {
+				perm |= 0x02
+			}
+		}
+		if c.props&CharNotify != 0 {
+			if c.secure&CharNotify != 0 {
+				props |= 0x100
+			} else {
+				props |= 0x10
+			}
+		}
+		if c.props&CharIndicate != 0 {
+			if c.secure&CharIndicate != 0 {
+				props |= 0x200
+			} else {
+				props |= 0x20
+			}
+		}
+
+		xc := xpc.Dict{
+			"kCBMsgArgAttributeID":              d.attrN,
+			"kCBMsgArgUUID":                     reverse(c.uuid.b),
+			"kCBMsgArgAttributePermissions":     perm,
+			"kCBMsgArgCharacteristicProperties": props,
+			"kCBMsgArgData":                     c.value,
+		}
+		d.attrs[d.attrN] = &attr{h: uint16(d.attrN), value: c.value, pvt: c}
+		d.attrN++
+
+		xds := xpc.Array{}
+		for _, d := range c.Descriptors() {
+			if d.uuid.Equal(attrClientCharacteristicConfigUUID) {
+				// skip CCCD
+				continue
+			}
+			xd := xpc.Dict{
+				"kCBMsgArgData": d.value,
+				"kCBMsgArgUUID": reverse(d.uuid.b),
+			}
+			xds = append(xds, xd)
+		}
+		xc["kCBMsgArgDescriptors"] = xds
+		xcs = append(xcs, xc)
+	}
+	xs["kCBMsgArgCharacteristics"] = xcs
+
+	rsp := d.sendReq(10, xs)
+	if res := rsp.MustGetInt("kCBMsgArgResult"); res != 0 {
+		return errors.New("FIXME: Add Srvice error")
+	}
+	return nil
+}
+
+func (d *device) SetServices(ss []*Service) error {
+	d.RemoveAllServices()
+	for _, s := range ss {
+		d.AddService(s)
+	}
+	return nil
 }
 
 func (d *device) Scan(ss []UUID, dup bool) {
-	// TODO: filter
-	d.hci.SetScanEnable(true, dup)
+	args := xpc.Dict{
+		"kCBMsgArgUUIDs": uuidSlice(ss),
+		"kCBMsgArgOptions": xpc.Dict{
+			"kCBScanOptionAllowDuplicates": map[bool]int{true: 1, false: 0}[dup],
+		},
+	}
+	d.sendCmd(29, args)
 }
 
 func (d *device) StopScanning() {
-	d.hci.SetScanEnable(false, true)
+	d.sendCmd(30, nil)
 }
 
 func (d *device) Connect(p Peripheral) {
-	d.hci.Connect(p.(*peripheral).pd)
+	pp := p.(*peripheral)
+	d.plist[pp.id.String()] = pp
+	d.sendCmd(31,
+		xpc.Dict{
+			"kCBMsgArgDeviceUUID": pp.id,
+			"kCBMsgArgOptions": xpc.Dict{
+				"kCBConnectOptionNotifyOnDisconnection": 1,
+			},
+		})
+}
+
+func (d *device) respondToRequest(id int, args xpc.Dict) {
+
+	switch id {
+	case 19: // ReadRequest
+		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
+		t := args.MustGetInt("kCBMsgArgTransactionID")
+		a := args.MustGetInt("kCBMsgArgAttributeID")
+		o := args.MustGetInt("kCBMsgArgOffset")
+
+		attr := d.attrs[a]
+		v := attr.value
+		if v == nil {
+			c := newCentral(d, u)
+			req := &ReadRequest{
+				Request: Request{Central: c},
+				Cap:     int(c.mtu - 1),
+				Offset:  o,
+			}
+			rsp := newResponseWriter(int(c.mtu - 1))
+			if c, ok := attr.pvt.(*Characteristic); ok {
+				c.rhandler.ServeRead(rsp, req)
+				v = rsp.bytes()
+			}
+		}
+
+		d.sendCmd(13, xpc.Dict{
+			"kCBMsgArgAttributeID":   a,
+			"kCBMsgArgData":          v,
+			"kCBMsgArgTransactionID": t,
+			"kCBMsgArgResult":        0,
+		})
+
+	case 20: // WriteRequest
+		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
+		t := args.MustGetInt("kCBMsgArgTransactionID")
+		a := 0
+		noRsp := false
+		xxws := args.MustGetArray("kCBMsgArgATTWrites")
+		for _, xxw := range xxws {
+			xw := xxw.(xpc.Dict)
+			if a == 0 {
+				a = xw.MustGetInt("kCBMsgArgAttributeID")
+			}
+			o := xw.MustGetInt("kCBMsgArgOffset")
+			i := xw.MustGetInt("kCBMsgArgIgnoreResponse")
+			b := xw.MustGetBytes("kCBMsgArgData")
+			_ = o
+			attr := d.attrs[a]
+			c := newCentral(d, u)
+			r := Request{Central: c}
+			attr.pvt.(*Characteristic).whandler.ServeWrite(r, b)
+			if i == 1 {
+				noRsp = true
+			}
+
+		}
+		if noRsp {
+			break
+		}
+		d.sendCmd(13, xpc.Dict{
+			"kCBMsgArgAttributeID":   a,
+			"kCBMsgArgData":          nil,
+			"kCBMsgArgTransactionID": t,
+			"kCBMsgArgResult":        0,
+		})
+
+	case 21: // subscribed
+		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
+		a := args.MustGetInt("kCBMsgArgAttributeID")
+		attr := d.attrs[a]
+		c := newCentral(d, u)
+		d.subscribers[u.String()] = c
+		c.startNotify(attr, c.mtu)
+
+	case 22: // unubscribed
+		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
+		a := args.MustGetInt("kCBMsgArgAttributeID")
+		attr := d.attrs[a]
+		if c := d.subscribers[u.String()]; c != nil {
+			c.stopNotify(attr)
+		}
+
+	case 23: // notificationSent
+	}
 }
 
 func (d *device) CancelConnection(p Peripheral) {
-	d.hci.CancelConnection(p.(*peripheral).pd)
+	d.sendCmd(32, xpc.Dict{"kCBMsgArgDeviceUUID": p.(*peripheral).id})
 }
 
-func (d *device) SendHCIRawCommand(c cmd.CmdParam) ([]byte, error) {
-	return d.hci.SendRawCommand(c)
-}
-
-func (d *device) GetPeripheral(b []byte, random bool) (Peripheral, error) {
-	pd, err := d.hci.GetPlatData(b)
-
-	if random {
-		pd.AddressType = 0x01
-	} else {
-		pd.AddressType = 0x00
-	}
-
+// process device events and asynchronous errors
+// (implements XpcEventHandler)
+func (d *device) HandleXpcEvent(event xpc.Dict, err error) {
 	if err != nil {
-		log.Printf("GetPeripheral(): %s", err.Error())
-		return nil, err
+		log.Println("error:", err)
+		return
 	}
 
-	p := &peripheral{pd: pd, d: d}
-	return p, nil
+	id := event.MustGetInt("kCBMsgId")
+	args := event.MustGetDict("kCBMsgArgs")
+	// log.Printf(">> %d, %v", id, args)
+
+	switch id {
+	case // device event
+		6,  // StateChanged
+		16, // AdvertisingStarted
+		17, // AdvertisingStopped
+		18: // ServiceAdded
+		d.rspc <- message{id: id, args: args}
+
+	case
+		19, // ReadRequest
+		20, // WriteRequest
+		21, // Subscribe
+		22, // Unubscribe
+		23: // Confirmation
+		d.respondToRequest(id, args)
+
+	case 37: // PeripheralDiscovered
+		xa := args.MustGetDict("kCBMsgArgAdvertisementData")
+		if len(xa) == 0 {
+			return
+		}
+		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
+		a := &Advertisement{
+			LocalName:        xa.GetString("kCBAdvDataLocalName", args.GetString("kCBMsgArgName", "")),
+			TxPowerLevel:     xa.GetInt("kCBAdvDataTxPowerLevel", 0),
+			ManufacturerData: xa.GetBytes("kCBAdvDataManufacturerData", nil),
+		}
+
+		rssi := args.MustGetInt("kCBMsgArgRssi")
+
+		if xu, ok := xa["kCBAdvDataServiceUUIDs"]; ok {
+			for _, xs := range xu.(xpc.Array) {
+				s := UUID{reverse(xs.([]byte))}
+				a.Services = append(a.Services, s)
+			}
+		}
+		if xsds, ok := xa["kCBAdvDataServiceData"]; ok {
+			xsd := xsds.(xpc.Array)
+			for i := 0; i < len(xsd); i += 2 {
+				sd := ServiceData{
+					UUID: UUID{xsd[i].([]byte)},
+					Data: xsd[i+1].([]byte),
+				}
+				a.ServiceData = append(a.ServiceData, sd)
+			}
+		}
+		if d.peripheralDiscovered != nil {
+			go d.peripheralDiscovered(&peripheral{id: xpc.UUID(u.b), d: d}, a, rssi)
+		}
+
+	case 38: // PeripheralConnected
+		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
+		p := &peripheral{
+			id:    xpc.UUID(u.b),
+			d:     d,
+			reqc:  make(chan message),
+			rspc:  make(chan message),
+			quitc: make(chan struct{}),
+			sub:   newSubscriber(),
+		}
+		d.plistmu.Lock()
+		d.plist[u.String()] = p
+		d.plistmu.Unlock()
+		go p.loop()
+
+		if d.peripheralConnected != nil {
+			go d.peripheralConnected(p, nil)
+		}
+
+	case 40: // PeripheralDisconnected
+		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
+		d.plistmu.Lock()
+		p := d.plist[u.String()]
+		delete(d.plist, u.String())
+		d.plistmu.Unlock()
+		if d.peripheralDisconnected != nil {
+			d.peripheralDisconnected(p, nil) // TODO: Get Result as error?
+		}
+		close(p.quitc)
+
+	case // Peripheral events
+		54, // RSSIRead
+		55, // ServiceDiscovered
+		62, // IncludedServiceDiscovered
+		63, // CharacteristicsDiscovered
+		70, // CharacteristicRead
+		71, // CharacteristicWritten
+		73, // NotifyValueSet
+		75, // DescriptorsDiscovered
+		78, // DescriptorRead
+		79: // DescriptorWritten
+
+		u := UUID{args.MustGetUUID("kCBMsgArgDeviceUUID")}
+		d.plistmu.Lock()
+		p := d.plist[u.String()]
+		d.plistmu.Unlock()
+		p.rspc <- message{id: id, args: args}
+
+	default:
+		log.Printf("Unhandled event: %#v", event)
+	}
 }
 
-// Flush pending advertising settings to the device.
-func (d *device) update() error {
-	if d.advParam != nil {
-		if err := d.hci.SendCmdWithAdvOff(d.advParam); err != nil {
-			return err
+func (d *device) sendReq(id int, args xpc.Dict) xpc.Dict {
+	m := message{id: id, args: args, rspc: make(chan xpc.Dict)}
+	d.reqc <- m
+	return <-m.rspc
+}
+
+func (d *device) sendCmd(id int, args xpc.Dict) {
+	d.reqc <- message{id: id, args: args}
+}
+
+func (d *device) loop() {
+	for req := range d.reqc {
+		d.sendCBMsg(req.id, req.args)
+		if req.rspc == nil {
+			continue
 		}
-		d.advParam = nil
+		m := <-d.rspc
+		req.rspc <- m.args
 	}
-	if d.scanResp != nil {
-		if err := d.hci.SendCmdWithAdvOff(d.scanResp); err != nil {
-			return err
-		}
-		d.scanResp = nil
-	}
-	if d.advData != nil {
-		if err := d.hci.SendCmdWithAdvOff(d.advData); err != nil {
-			return err
-		}
-		d.advData = nil
-	}
-	return nil
+}
+
+func (d *device) sendCBMsg(id int, args xpc.Dict) {
+	// log.Printf("<< %d, %v", id, args)
+	d.conn.Send(xpc.Dict{"kCBMsgId": id, "kCBMsgArgs": args}, false)
 }
