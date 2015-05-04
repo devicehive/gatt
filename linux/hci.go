@@ -1,6 +1,7 @@
 package linux
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 )
 
 type HCI struct {
+	sync.Mutex
 	AcceptMasterHandler  func(pd *PlatData)
 	AcceptSlaveHandler   func(pd *PlatData)
 	AdvertisementHandler func(pd *PlatData)
@@ -83,6 +85,37 @@ func NewHCI(devID int, chk bool, maxConn int) (*HCI, error) {
 	return h, nil
 }
 
+func (h *HCI) GetPlatData(b []byte) (*PlatData, error) {
+	var addr [6]byte
+
+	if len(b) != len(addr) {
+		return nil, errors.New(fmt.Sprintf("Invalid length of address (%v) expecting %v", len(b), len(addr)))
+	}
+
+	for i, val := range b {
+		addr[i] = val
+	}
+
+	h.plistmu.Lock()
+	pd, ok := h.plist[addr]
+	if !ok {
+		log.Print("Peripheral was never discovered, adding")
+		pd = &PlatData{
+			AddressType: 0x00,
+			Address:     addr,
+			Data:        nil,
+			Connectable: true,
+			RSSI:        0,
+		}
+		log.Printf("GetPlatData() 1: %+v", pd)
+		h.plist[addr] = pd
+	}
+	h.plistmu.Unlock()
+
+	log.Printf("GetPlatData() 2: %+v", pd)
+	return pd, nil
+}
+
 func (h *HCI) Close() error {
 	for _, c := range h.conns {
 		c.Close()
@@ -91,6 +124,8 @@ func (h *HCI) Close() error {
 }
 
 func (h *HCI) SetAdvertiseEnable(en bool) error {
+	h.Lock()
+	defer h.Unlock()
 	h.advmu.Lock()
 	h.adv = en
 	h.advmu.Unlock()
@@ -119,6 +154,9 @@ func (h *HCI) SendCmdWithAdvOff(c cmd.CmdParam) error {
 }
 
 func (h *HCI) SetScanEnable(en bool, dup bool) error {
+	h.Lock()
+	defer h.Unlock()
+
 	return h.c.SendAndCheckResp(
 		cmd.LESetScanEnable{
 			LEScanEnable:     btoi(en),
@@ -127,6 +165,9 @@ func (h *HCI) SetScanEnable(en bool, dup bool) error {
 }
 
 func (h *HCI) Connect(pd *PlatData) error {
+	h.Lock()
+	defer h.Unlock()
+
 	h.c.Send(
 		cmd.LECreateConn{
 			LEScanInterval:        0x0004,         // N x 0.625ms
@@ -146,6 +187,17 @@ func (h *HCI) Connect(pd *PlatData) error {
 }
 
 func (h *HCI) CancelConnection(pd *PlatData) error {
+	h.Lock()
+	defer h.Unlock()
+
+	log.Print("Closing...")
+
+	// If there's no underlyig connection, try to cancel
+	if pd.Conn == nil {
+		_, err := h.SendRawCommand(cmd.LECreateConnCancel{})
+		return err
+	}
+
 	return pd.Conn.Close()
 }
 
@@ -218,7 +270,7 @@ func (h *HCI) resetDevice() error {
 			HostTotalNumACLDataPackets:         0x0014,
 			HostTotalNumSynchronousDataPackets: 0x000a},
 		cmd.LESetScanParameters{
-			LEScanType:           0x01,   // [0x00]: passive, 0x01: active
+			LEScanType:           0x00,   // [0x00]: passive, 0x01: active
 			LEScanInterval:       0x0010, // [0x10]: 0.625ms * 16
 			LEScanWindow:         0x0010, // [0x10]: 0.625ms * 16
 			OwnAddressType:       0x00,   // [0x00]: public, 0x01: random
@@ -291,15 +343,22 @@ func (h *HCI) handleNumberOfCompletedPkts(b []byte) error {
 
 func (h *HCI) handleConnection(b []byte) {
 	ep := &evt.LEConnectionCompleteEP{}
+
 	if err := ep.Unmarshal(b); err != nil {
 		return // FIXME
 	}
+
+	log.Printf("handleConnection(): %v", ep)
+	if ep.Status == 0x02 { // Connection cancel
+		return
+	}
+
 	hh := ep.ConnectionHandle
 	c := newConn(h, hh)
 	h.connsmu.Lock()
 	h.conns[hh] = c
 	h.connsmu.Unlock()
-	h.setAdvertiseEnable(true)
+	// h.setAdvertiseEnable(true)
 
 	// FIXME: sloppiness. This call should be called by the package user once we
 	// flesh out the support of l2cap signaling packets (CID:0x0001,0x0005)
@@ -339,7 +398,7 @@ func (h *HCI) handleDisconnectionComplete(b []byte) error {
 	}
 	delete(h.conns, hh)
 	close(c.aclc)
-	h.setAdvertiseEnable(true)
+	// h.setAdvertiseEnable(true)
 	return nil
 }
 

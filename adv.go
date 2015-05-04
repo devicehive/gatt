@@ -2,6 +2,7 @@ package gatt
 
 import (
 	"errors"
+	"fmt"
 	"log"
 )
 
@@ -93,8 +94,8 @@ func (a *Advertisement) unmarshall(b []byte) error {
 			return errors.New("invalid advertise data")
 		}
 		l, t := b[0], b[1]
-		if len(b) < int(1+l) {
-			return errors.New("invalid advertise data")
+		if len(b) < int(2+l) {
+			return errors.New(fmt.Sprintf("advertise data length mismatch: %v", b))
 		}
 		d := b[2 : 1+l]
 		switch t {
@@ -130,8 +131,13 @@ func (a *Advertisement) unmarshall(b []byte) error {
 		// case typeServiceData16,
 		// case typeServiceData32,
 		// case typeServiceData128:
+
 		default:
 			log.Printf("DATA: [ % X ]", d)
+		}
+
+		if len(b) < int(l+1) {
+			return errors.New(fmt.Sprintf("advertise data length mismatch: %v", b))
 		}
 		b = b[1+l:]
 	}

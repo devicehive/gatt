@@ -82,7 +82,9 @@ func (c *Cmd) Send(cp CmdParam) ([]byte, error) {
 	} else if n != len(raw) {
 		return nil, errors.New("Failed to send whole Cmd pkt to HCI socket")
 	}
-	return <-p.done, nil
+
+	r := <-p.done
+	return r, nil
 }
 
 func (c *Cmd) SendAndCheckResp(cp CmdParam, exp []byte) error {

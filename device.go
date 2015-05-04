@@ -80,6 +80,7 @@ type Device interface {
 
 	// Option sets the options specified.
 	Option(o ...Option) error
+	GetPeripheral(b []byte) (Peripheral, error)
 }
 
 // deviceHandler is the handlers(callbacks) of the Device.

@@ -2,6 +2,7 @@ package gatt
 
 import (
 	"encoding/binary"
+	"log"
 	"net"
 
 	"github.com/paypal/gatt/linux"
@@ -45,7 +46,7 @@ func NewDevice(opts ...Option) (Device, error) {
 			AdvertisingFilterPolicy: 0x00,
 		},
 		scanParam: &cmd.LESetScanParameters{
-			LEScanType:           0x01,   // [0x00]: passive, 0x01: active
+			LEScanType:           0x00,   // [0x00]: passive, 0x01: active
 			LEScanInterval:       0x0010, // [0x10]: 0.625ms * 16
 			LEScanWindow:         0x0010, // [0x10]: 0.625ms * 16
 			OwnAddressType:       0x00,   // [0x00]: public, 0x01: random
@@ -214,6 +215,18 @@ func (d *device) CancelConnection(p Peripheral) {
 
 func (d *device) SendHCIRawCommand(c cmd.CmdParam) ([]byte, error) {
 	return d.hci.SendRawCommand(c)
+}
+
+func (d *device) GetPeripheral(b []byte) (Peripheral, error) {
+	pd, err := d.hci.GetPlatData(b)
+
+	if err != nil {
+		log.Printf("GetPeripheral(): %s", err.Error())
+		return nil, err
+	}
+
+	p := &peripheral{pd: pd, d: d}
+	return p, nil
 }
 
 // Flush pending advertising settings to the device.

@@ -4,15 +4,17 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/paypal/gatt/linux"
 	"io"
 	"log"
 	"net"
 	"strings"
-
-	"github.com/paypal/gatt/linux"
+	"sync"
+	"time"
 )
 
 type peripheral struct {
+	sync.Mutex
 	// NameChanged is called whenever the peripheral GAP device name has changed.
 	NameChanged func(*peripheral)
 
@@ -50,6 +52,8 @@ func finish(op byte, h uint16, b []byte) bool {
 }
 
 func (p *peripheral) DiscoverServices(s []UUID) ([]*Service, error) {
+	p.Lock()
+	defer p.Unlock()
 	// TODO: implement the UUID filters
 	// p.pd.Conn.Write([]byte{0x02, 0x87, 0x00}) // MTU
 	done := false
@@ -62,7 +66,11 @@ func (p *peripheral) DiscoverServices(s []UUID) ([]*Service, error) {
 		binary.LittleEndian.PutUint16(b[3:5], 0xFFFF)
 		binary.LittleEndian.PutUint16(b[5:7], 0x2800)
 
-		b = p.sendReq(op, b)
+		b, err := p.sendReq(op, b)
+
+		if err != nil {
+			return nil, err
+		}
 		if finish(op, start, b) {
 			break
 		}
@@ -93,11 +101,15 @@ func (p *peripheral) DiscoverServices(s []UUID) ([]*Service, error) {
 }
 
 func (p *peripheral) DiscoverIncludedServices(ss []UUID, s *Service) ([]*Service, error) {
+	p.Lock()
+	defer p.Unlock()
 	// TODO
 	return nil, nil
 }
 
 func (p *peripheral) DiscoverCharacteristics(cs []UUID, s *Service) ([]*Characteristic, error) {
+	p.Lock()
+	defer p.Unlock()
 	// TODO: implement the UUID filters
 	done := false
 	start := s.h
@@ -110,7 +122,12 @@ func (p *peripheral) DiscoverCharacteristics(cs []UUID, s *Service) ([]*Characte
 		binary.LittleEndian.PutUint16(b[3:5], s.endh)
 		binary.LittleEndian.PutUint16(b[5:7], 0x2803)
 
-		b = p.sendReq(op, b)
+		b, err := p.sendReq(op, b)
+
+		if err != nil {
+			return nil, err
+		}
+
 		if finish(op, start, b) {
 			break
 		}
@@ -158,6 +175,8 @@ func (p *peripheral) DiscoverCharacteristics(cs []UUID, s *Service) ([]*Characte
 }
 
 func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descriptor, error) {
+	p.Lock()
+	defer p.Unlock()
 	// TODO: implement the UUID filters
 	done := false
 	start := c.vh + 1
@@ -171,7 +190,12 @@ func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descr
 		binary.LittleEndian.PutUint16(b[1:3], start)
 		binary.LittleEndian.PutUint16(b[3:5], c.endh)
 
-		b = p.sendReq(op, b)
+		b, err := p.sendReq(op, b)
+
+		if err != nil {
+			return nil, err
+		}
+
 		if finish(attOpFindInfoReq, start, b) {
 			break
 		}
@@ -205,17 +229,27 @@ func (p *peripheral) DiscoverDescriptors(ds []UUID, c *Characteristic) ([]*Descr
 }
 
 func (p *peripheral) ReadCharacteristic(c *Characteristic) ([]byte, error) {
+	p.Lock()
+	defer p.Unlock()
+
 	b := make([]byte, 3)
 	op := byte(attOpReadReq)
 	b[0] = op
 	binary.LittleEndian.PutUint16(b[1:3], c.vh)
 
-	b = p.sendReq(op, b)
+	b, err := p.sendReq(op, b)
+	if err != nil {
+		return nil, err
+	}
+
 	b = b[1:]
 	return b, nil
 }
 
 func (p *peripheral) WriteCharacteristic(c *Characteristic, value []byte, noRsp bool) error {
+	p.Lock()
+	defer p.Unlock()
+
 	b := make([]byte, 3+len(value))
 	op := byte(attOpWriteReq)
 	b[0] = op
@@ -225,36 +259,54 @@ func (p *peripheral) WriteCharacteristic(c *Characteristic, value []byte, noRsp 
 	binary.LittleEndian.PutUint16(b[1:3], c.vh)
 	copy(b[3:], value)
 
-	if !noRsp {
+	if noRsp {
 		p.sendCmd(op, b)
 		return nil
 	}
-	b = p.sendReq(op, b)
+	b, err := p.sendReq(op, b)
+	if err != nil {
+		return err
+	}
+
 	// TODO: error handling
 	b = b[1:]
 	return nil
 }
 
 func (p *peripheral) ReadDescriptor(d *Descriptor) ([]byte, error) {
+	p.Lock()
+	defer p.Unlock()
+
 	b := make([]byte, 3)
 	op := byte(attOpReadReq)
 	b[0] = op
 	binary.LittleEndian.PutUint16(b[1:3], d.h)
 
-	b = p.sendReq(op, b)
+	b, err := p.sendReq(op, b)
+	if err != nil {
+		return nil, err
+	}
+
 	b = b[1:]
 	// TODO: error handling
 	return b, nil
 }
 
 func (p *peripheral) WriteDescriptor(d *Descriptor, value []byte) error {
+	p.Lock()
+	defer p.Unlock()
+
 	b := make([]byte, 3+len(value))
 	op := byte(attOpWriteReq)
 	b[0] = op
 	binary.LittleEndian.PutUint16(b[1:3], d.h)
 	copy(b[3:], value)
 
-	b = p.sendReq(op, b)
+	b, err := p.sendReq(op, b)
+	if err != nil {
+		return err
+	}
+
 	b = b[1:]
 	// TODO: error handling
 	return nil
@@ -276,7 +328,11 @@ func (p *peripheral) setNotifyValue(c *Characteristic, flag uint16,
 	binary.LittleEndian.PutUint16(b[1:3], c.cccd.h)
 	binary.LittleEndian.PutUint16(b[3:5], ccc)
 
-	b = p.sendReq(op, b)
+	b, err := p.sendReq(op, b)
+	if err != nil {
+		return err
+	}
+
 	b = b[1:]
 	// TODO: error handling
 	if f == nil {
@@ -287,14 +343,17 @@ func (p *peripheral) setNotifyValue(c *Characteristic, flag uint16,
 
 func (p *peripheral) SetNotifyValue(c *Characteristic,
 	f func(*Characteristic, []byte, error)) error {
+	p.Lock()
+	defer p.Unlock()
 	return p.setNotifyValue(c, gattCCCNotifyFlag, f)
 }
 
 func (p *peripheral) SetIndicateValue(c *Characteristic,
 	f func(*Characteristic, []byte, error)) error {
+	p.Lock()
+	defer p.Unlock()
 	return p.setNotifyValue(c, gattCCCIndicateFlag, f)
 }
-
 
 func (p *peripheral) ReadRSSI() int {
 	// TODO: implement
@@ -321,10 +380,16 @@ func (p *peripheral) sendCmd(op byte, b []byte) {
 	p.reqc <- message{op: op, b: b}
 }
 
-func (p *peripheral) sendReq(op byte, b []byte) []byte {
+func (p *peripheral) sendReq(op byte, b []byte) ([]byte, error) {
 	m := message{op: op, b: b, rspc: make(chan []byte)}
 	p.reqc <- m
-	return <-m.rspc
+	select {
+	case res := <-m.rspc:
+		return res, nil
+	case <-time.After(5 * time.Second): // TODO: Config?
+		return nil, errors.New("Waiting for response timed out")
+	}
+
 }
 
 func (p *peripheral) loop() {

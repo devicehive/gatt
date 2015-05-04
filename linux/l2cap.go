@@ -1,11 +1,11 @@
 package linux
 
 import (
+	"errors"
 	"fmt"
+	"github.com/paypal/gatt/linux/cmd"
 	"io"
 	"log"
-
-	"github.com/paypal/gatt/linux/cmd"
 )
 
 type aclData struct {
@@ -133,9 +133,12 @@ func (c *conn) Close() error {
 	h.connsmu.Lock()
 	defer h.connsmu.Unlock()
 	_, found := h.conns[hh]
+
+	log.Printf("conns: %+v", h.conns)
+
 	if !found {
-		// log.Printf("l2conn: 0x%04x already disconnected", hh)
-		return nil
+		h.SendRawCommand(cmd.LECreateConnCancel{}) // If not found,try to cancel pending connection attempt
+		return errors.New("Connection not open")
 	}
 	if err, _ := h.c.Send(cmd.Disconnect{ConnectionHandle: hh, Reason: 0x13}); err != nil {
 		return fmt.Errorf("l2conn: failed to disconnect, %s", err)
