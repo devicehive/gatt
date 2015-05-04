@@ -460,3 +460,7 @@ func (d *device) sendCBMsg(id int, args xpc.Dict) {
 	// log.Printf("<< %d, %v", id, args)
 	d.conn.Send(xpc.Dict{"kCBMsgId": id, "kCBMsgArgs": args}, false)
 }
+
+func (d *device) GetPeripheral(b []byte, random bool) (Peripheral, error) {
+	return nil, errors.New("notImplemented")
+}
