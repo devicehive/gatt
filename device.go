@@ -80,7 +80,9 @@ type Device interface {
 
 	// Option sets the options specified.
 	Option(o ...Option) error
-	GetPeripheral(b []byte) (Peripheral, error)
+	
+	// Get peripheral by MAC address and connection type
+	GetPeripheral(b []byte, random bool) (Peripheral, error)
 }
 
 // deviceHandler is the handlers(callbacks) of the Device.
