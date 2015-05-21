@@ -176,12 +176,16 @@ func (h *HCI) Connect(pd *PlatData) error {
 			PeerAddressType:       pd.AddressType, // public or random
 			PeerAddress:           pd.Address,     //
 			OwnAddressType:        0x00,           // public
-			ConnIntervalMin:       0x0006,         // N x 0.125ms
-			ConnIntervalMax:       0x0006,         // N x 0.125ms
-			ConnLatency:           0x0000,         //
-			SupervisionTimeout:    0x000A,         // N x 10ms
-			MinimumCELength:       0x0000,         // N x 0.625ms
-			MaximumCELength:       0x0000,         // N x 0.625ms
+
+			//			ConnIntervalMin:       0x0006,         // N x 0.125ms
+			//			ConnIntervalMax:       0x0006,         // N x 0.125ms
+
+			ConnIntervalMin:    0x0010, // N x 0.125ms
+			ConnIntervalMax:    0x0010, // N x 0.125ms
+			ConnLatency:        0x0000, //
+			SupervisionTimeout: 0x000A, // N x 10ms
+			MinimumCELength:    0x0000, // N x 0.625ms
+			MaximumCELength:    0x0000, // N x 0.625ms
 		})
 	return nil
 }
@@ -270,7 +274,7 @@ func (h *HCI) resetDevice() error {
 			HostTotalNumACLDataPackets:         0x0014,
 			HostTotalNumSynchronousDataPackets: 0x000a},
 		cmd.LESetScanParameters{
-			LEScanType:           0x00,   // [0x00]: passive, 0x01: active
+			LEScanType:           0x01,   // [0x00]: passive, 0x01: active
 			LEScanInterval:       0x0010, // [0x10]: 0.625ms * 16
 			LEScanWindow:         0x0010, // [0x10]: 0.625ms * 16
 			OwnAddressType:       0x00,   // [0x00]: public, 0x01: random
