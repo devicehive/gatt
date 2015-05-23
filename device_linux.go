@@ -5,8 +5,8 @@ import (
 	"log"
 	"net"
 
-	"github.com/paypal/gatt/linux"
-	"github.com/paypal/gatt/linux/cmd"
+	"github.com/devicehive/gatt/linux"
+	"github.com/devicehive/gatt/linux/cmd"
 )
 
 type device struct {

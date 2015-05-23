@@ -3,7 +3,7 @@ package linux
 import (
 	"errors"
 	"fmt"
-	"github.com/paypal/gatt/linux/cmd"
+	"github.com/devicehive/gatt/linux/cmd"
 	"io"
 	"log"
 )

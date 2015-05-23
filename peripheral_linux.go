@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/paypal/gatt/linux"
+	"github.com/devicehive/gatt/linux"
 	"io"
 	"log"
 	"net"

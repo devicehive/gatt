@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/paypal/gatt"
-	"github.com/paypal/gatt/examples/option"
-	"github.com/paypal/gatt/examples/service"
+	"github.com/devicehive/gatt"
+	"github.com/devicehive/gatt/examples/option"
+	"github.com/devicehive/gatt/examples/service"
 )
 
 func main() {
