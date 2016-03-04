@@ -220,15 +220,15 @@ func (d *device) SendHCIRawCommand(c cmd.CmdParam) ([]byte, error) {
 func (d *device) GetPeripheral(b []byte, random bool) (Peripheral, error) {
 	pd, err := d.hci.GetPlatData(b)
 
+	if err != nil {
+		log.Printf("GetPeripheral(): %s", err.Error())
+		return nil, err
+	}
+
 	if random {
 		pd.AddressType = 0x01
 	} else {
 		pd.AddressType = 0x00
-	}
-
-	if err != nil {
-		log.Printf("GetPeripheral(): %s", err.Error())
-		return nil, err
 	}
 
 	p := &peripheral{pd: pd, d: d}
